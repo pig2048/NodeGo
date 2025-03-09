@@ -1,0 +1,21 @@
+{
+    "use_proxy": true,
+    "retry_settings": {
+        "max_retries": 3,
+        "retry_delay": 5,
+        "rate_limit_reset_time": 60
+    },
+    "timing": {
+        "min_interval": 180,
+        "max_interval": 300,
+        "account_delay": {
+            "min": 1.0,
+            "max": 3.0
+        }
+    },
+    "output": {
+        "show_proxy_info": true,
+        "show_detailed_errors": true,
+        "color_output": true
+    }
+} 
