@@ -13,9 +13,26 @@
             "max": 3.0
         }
     },
+    "auto_restart": {
+        "enabled": true,
+        "hours": 1,
+        "clear_error_caches": true,
+        "min_success_rate": 0.3,
+        "min_cycles": 2
+    },
+    "ssl_settings": {
+        "verify": false,
+        "disable_warnings": true
+    },
     "output": {
         "show_proxy_info": true,
         "show_detailed_errors": true,
         "color_output": true
+    },
+    "logging": {
+        "enabled": true,
+        "level": "INFO",
+        "rotate_size": 10485760,
+        "backup_count": 5
     }
-} 
+}
