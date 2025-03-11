@@ -15,6 +15,8 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 import logging
 import threading
+import sys
+import logging.handlers
 
 
 colorama.init(autoreset=True)
@@ -68,12 +70,21 @@ def create_session_with_retries():
         allowed_methods=["GET", "POST"]
     )
     
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=100,
+        pool_maxsize=100
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
     
     session.verify = False
+    session.trust_env = False  
+    
+    
+    requests.packages.urllib3.disable_warnings()
     
     return session
 
@@ -86,7 +97,15 @@ class NodeGoPinger:
         self.proxy = self._setup_proxy(proxy_url)
         self.last_ping_timestamp = 0
         self.session = create_session_with_retries()
-        self.jitter = random.uniform(0.5, 1.5)  
+        self.jitter = random.uniform(0.5, 1.5)
+        
+        
+        config = load_config()
+        self.ssl_verify = False  
+        
+        
+        self.session.verify = False
+        self.session.trust_env = False
     
     def _setup_proxy(self, proxy_url):
         
@@ -130,7 +149,6 @@ class NodeGoPinger:
             return None
 
     def make_request(self, method, endpoint, data=None):
-        
         url = f"{self.api_base_url}{endpoint}"
         
         headers = {
@@ -140,51 +158,43 @@ class NodeGoPinger:
             'User-Agent': get_random_ua()
         }
         
-        
         with GLOBAL_LOCK:
             if self.bearer_token in RATE_LIMITED_TOKENS:
                 reset_time = RATE_LIMITED_TOKENS[self.bearer_token]
                 if time.time() < reset_time:
                     wait_time = int(reset_time - time.time())
                     print(f"{Fore.YELLOW}⏳ 令牌 {self.bearer_token[:10]}... 正在等待速率限制重置，还需 {wait_time} 秒")
-                    time.sleep(1)  
+                    time.sleep(1)
                     raise Exception("令牌仍在速率限制中")
                 else:
-                    
                     del RATE_LIMITED_TOKENS[self.bearer_token]
-        
         
         if self.proxy_url and self.proxy_url in SSL_ERROR_PROXIES:
             print(f"{Fore.YELLOW}🔒 代理 {self.proxy_url} 之前有SSL错误，跳过...")
             raise Exception("代理SSL错误")
-        
         
         time.sleep(random.uniform(0.5, 2.0) * self.jitter)
         
         for attempt in range(MAX_RETRIES):
             try:
                 response = None
-                if method.upper() == 'GET':
-                    response = self.session.get(
-                        url, 
-                        headers=headers, 
-                        proxies=self.proxy, 
-                        timeout=30
-                    )
-                elif method.upper() == 'POST':
-                    response = self.session.post(
-                        url, 
-                        headers=headers, 
-                        json=data, 
-                        proxies=self.proxy, 
-                        timeout=30
-                    )
+                request_kwargs = {
+                    'headers': headers,
+                    'proxies': self.proxy,
+                    'timeout': 30,
+                    'verify': False,  
+                    'allow_redirects': True
+                }
                 
+                if method.upper() == 'GET':
+                    response = self.session.get(url, **request_kwargs)
+                elif method.upper() == 'POST':
+                    request_kwargs['json'] = data
+                    response = self.session.post(url, **request_kwargs)
                 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', RATE_LIMIT_RESET_TIME))
                     reset_time = time.time() + retry_after
-                    
                     
                     with GLOBAL_LOCK:
                         RATE_LIMITED_TOKENS[self.bearer_token] = reset_time
@@ -196,14 +206,12 @@ class NodeGoPinger:
                 return response
             
             except requests.exceptions.SSLError as e:
-                
                 if self.proxy_url:
                     with GLOBAL_LOCK:
                         SSL_ERROR_PROXIES.add(self.proxy_url)
                 
                 print(f"{Fore.RED}🔒 SSL错误 (尝试 {attempt+1}/{MAX_RETRIES}): {e}")
                 if attempt < MAX_RETRIES - 1:
-                    
                     sleep_time = RETRY_DELAY * (attempt + 1) * self.jitter
                     print(f"{Fore.YELLOW}⏳ 等待 {sleep_time:.1f} 秒后重试...")
                     time.sleep(sleep_time)
@@ -244,37 +252,122 @@ class NodeGoPinger:
             return None
 
 def load_config():
-   
-    try:
-        with open('config.json', 'r', encoding='utf-8') as f:
-            config = json.load(f)
-        return config
-    except FileNotFoundError:
-        print(f"{Fore.YELLOW}>> 未找到配置文件，使用默认配置")
-        return {
-            "use_proxy": True,
-            "retry_settings": {
-                "max_retries": 3,
-                "retry_delay": 5,
-                "rate_limit_reset_time": 60
-            },
-            "timing": {
-                "min_interval": 180,
-                "max_interval": 300,
-                "account_delay": {
-                    "min": 1.0,
-                    "max": 3.0
-                }
-            },
-            "output": {
-                "show_proxy_info": True,
-                "show_detailed_errors": True,
-                "color_output": True
+    
+    default_config = {
+        "use_proxy": True,
+        "retry_settings": {
+            "max_retries": 3,
+            "retry_delay": 5,
+            "rate_limit_reset_time": 60
+        },
+        "timing": {
+            "min_interval": 180,
+            "max_interval": 300,
+            "account_delay": {
+                "min": 1.0,
+                "max": 3.0
             }
+        },
+        "auto_restart": {
+            "enabled": True,
+            "hours": 1,  
+            "clear_error_caches": True,
+            "min_success_rate": 0.3,  
+            "min_cycles": 2  
+        },
+        "output": {
+            "show_proxy_info": True,
+            "show_detailed_errors": True,
+            "color_output": True
+        },
+        "logging": {
+            "enabled": True,
+            "level": "INFO",
+            "rotate_size": 10485760,  
+            "backup_count": 5
+        },
+        "ssl_settings": {
+            "verify": False,
+            "disable_warnings": True
         }
-    except json.JSONDecodeError:
-        print(f"{Fore.RED}>> 配置文件格式错误，使用默认配置")
+    }
+
+    try:
+        if os.path.exists('config.json'):
+            with open('config.json', 'r', encoding='utf-8') as f:
+                user_config = json.load(f)
+                
+                def update_config(default, user):
+                    for key, value in default.items():
+                        if key not in user:
+                            user[key] = value
+                        elif isinstance(value, dict) and isinstance(user[key], dict):
+                            update_config(value, user[key])
+                update_config(default_config, user_config)
+                return user_config
+        else:
+            
+            with open('config.json', 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=4, ensure_ascii=False)
+            print(f"{Fore.GREEN}>> 已创建默认配置文件 config.json")
+            return default_config
+    except Exception as e:
+        print(f"{Fore.RED}>> 配置文件操作失败: {e}")
         return default_config
+
+def setup_logging(config):
+    
+    if not config.get("logging", {}).get("enabled", True):
+        return
+
+    if not os.path.exists('logs'):
+        os.makedirs('logs')
+
+    log_filename = f"logs/nodego_ping_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    
+   
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_filename,
+        maxBytes=config["logging"]["rotate_size"],
+        backupCount=config["logging"]["backup_count"],
+        encoding='utf-8'
+    )
+    
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(formatter)
+    
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(config["logging"]["level"])
+    root_logger.addHandler(file_handler)
+    
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+def restart_program():
+    
+    logging.info("准备重启程序...")
+    print(f"\n{Fore.YELLOW}>> 程序即将重启...")
+    
+    
+    logging.shutdown()
+    
+    
+    time.sleep(2)
+    
+    try:
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
+    except Exception as e:
+        logging.error(f"重启失败: {e}")
+        print(f"{Fore.RED}>> 重启失败: {e}")
+        sys.exit(1)
 
 class MultiAccountPinger:
     
@@ -284,6 +377,8 @@ class MultiAccountPinger:
         self.is_running = True
         self.success_count = 0
         self.failure_count = 0
+        self.run_count = 0  
+        self.start_time = time.time()   
         
         
         global MAX_RETRIES, RETRY_DELAY, RATE_LIMIT_RESET_TIME
@@ -376,10 +471,39 @@ class MultiAccountPinger:
         else:
             return random.randint(min_interval, max_interval)
     
+    def check_restart_needed(self):
+        
+        
+        if not self.config.get("auto_restart", {}).get("enabled", False):
+            return False
+
+        
+        restart_config = self.config["auto_restart"]
+        restart_hours = restart_config.get("hours", 1)
+        min_success_rate = restart_config.get("min_success_rate", 0.3)
+        min_cycles = restart_config.get("min_cycles", 2)
+
+        
+        run_time = (time.time() - self.start_time) / 3600
+
+        
+        if run_time >= restart_hours:
+            logging.info(f"触发定时重启: 已运行 {run_time:.2f} 小时")
+            return True
+
+        
+        if self.run_count >= min_cycles:
+            total_requests = self.success_count + self.failure_count
+            if total_requests > 0:
+                success_rate = self.success_count / total_requests
+                if success_rate < min_success_rate:
+                    logging.warning(f"触发低成功率重启: 当前成功率 {success_rate:.1%}")
+                    return True
+
+        return False
+
     def run_pinger(self):
-        
         display_banner()
-        
         
         def signal_handler(sig, frame):
             print(f"\n{Fore.YELLOW}>> 正在安全停止程序...")
@@ -391,10 +515,31 @@ class MultiAccountPinger:
         
         print(f"\n{Fore.CYAN}>> 程序启动完成，开始执行...")
         
+        
+        if self.config.get("auto_restart", {}).get("enabled", False):
+            restart_hours = self.config["auto_restart"]["hours"]
+            next_restart_time = time.strftime('%Y-%m-%d %H:%M:%S', 
+                time.localtime(self.start_time + restart_hours * 3600))
+            print(f"{Fore.YELLOW}>> 已启用自动重启，预计重启时间: {next_restart_time}")
+
         while self.is_running:
             current_time = time.strftime('%Y-%m-%d %H:%M:%S')
             print(f"\n{Fore.WHITE}═══════════ 当前时间: {current_time} ═══════════")
             
+           
+            if self.check_restart_needed():
+                print(f"\n{Fore.YELLOW}>> 准备执行自动重启...")
+                
+                
+                if self.config["auto_restart"].get("clear_error_caches", True):
+                    with GLOBAL_LOCK:
+                        SSL_ERROR_PROXIES.clear()
+                        RATE_LIMITED_TOKENS.clear()
+                    print(f"{Fore.GREEN}>> 已清除错误缓存")
+                    logging.info("已清除错误缓存")
+                
+                restart_program()
+                break
             
             cycle_success = 0
             cycle_total = 0
@@ -407,25 +552,46 @@ class MultiAccountPinger:
                 print(f"\n{Fore.CYAN}>> 正在处理第 {index}/{len(self.accounts)} 个账户")
                 
                 
-                time.sleep(random.uniform(1.0, 3.0))
+                delay = random.uniform(
+                    self.config["timing"]["account_delay"]["min"],
+                    self.config["timing"]["account_delay"]["max"]
+                )
+                time.sleep(delay)
                 
                 result = self.process_ping(account)
-                if not result:
-                    print(f"{Fore.RED}>> 第 {index} 个账户处理失败")
                 cycle_total += 1
                 if result:
                     cycle_success += 1
+                    self.success_count += 1
+                else:
+                    print(f"{Fore.RED}>> 第 {index} 个账户处理失败")
+                    self.failure_count += 1
+            
+            
+            self.run_count += 1
             
             
             success_ratio = cycle_success / cycle_total if cycle_total > 0 else 0
             print(f"\n{Fore.CYAN}═══════════ 本轮统计 ═══════════")
             print(f"{Fore.WHITE}>> 成功: {cycle_success}/{cycle_total} ({success_ratio:.1%})")
             
+            
+            total_success_ratio = self.success_count / (self.success_count + self.failure_count) if (self.success_count + self.failure_count) > 0 else 0
+            print(f"{Fore.WHITE}>> 总计: 成功 {self.success_count}，失败 {self.failure_count}，成功率 {total_success_ratio:.1%}")
+            
+            
+            run_time_hours = (time.time() - self.start_time) / 3600
+            print(f"{Fore.WHITE}>> 已运行时间: {run_time_hours:.2f} 小时")
+            
+            if self.config.get("auto_restart", {}).get("enabled", False):
+                restart_hours = self.config["auto_restart"]["hours"]
+                remaining_hours = restart_hours - run_time_hours
+                if remaining_hours > 0:
+                    print(f"{Fore.WHITE}>> 距离自动重启还有: {remaining_hours:.2f} 小时")
+
             if self.is_running:
-                
                 delay_ms = self.random_delay(success_ratio)
                 delay_sec = round(delay_ms / 1000)
-                
                 
                 next_run = time.strftime('%H:%M:%S', time.localtime(time.time() + delay_sec))
                 print(f"\n{Fore.MAGENTA}>> 等待间隔: {delay_sec} 秒")
@@ -433,12 +599,11 @@ class MultiAccountPinger:
                 print(f"{Fore.BLUE}════════════════════════════════════════════════════")
                 
                 
-                sleep_chunks = min(30, delay_sec)  
+                sleep_chunks = min(30, delay_sec)
                 for _ in range(int(delay_sec / sleep_chunks)):
                     if not self.is_running:
                         break
                     time.sleep(sleep_chunks)
-                
                 
                 remaining = delay_sec % sleep_chunks
                 if remaining > 0 and self.is_running:
@@ -447,10 +612,26 @@ class MultiAccountPinger:
 
 if __name__ == "__main__":
     try:
+        
+        config = load_config()
+        
+        
+        setup_logging(config)
+        
+        
+        logging.info("程序启动")
+        logging.info(f"Python版本: {sys.version}")
+        logging.info(f"操作系统: {sys.platform}")
+        
+        
         multi_pinger = MultiAccountPinger()
         multi_pinger.run_pinger()
     
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}程序被用户中断")
+        logging.info("程序被用户中断")
     except Exception as e:
         print(f"{Fore.RED}程序异常: {e}")
+        logging.error(f"程序异常: {e}", exc_info=True)
+    finally:
+        logging.info("程序退出")
